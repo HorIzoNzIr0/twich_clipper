@@ -1,4 +1,5 @@
 import subprocess, pathlib, threading, datetime as dt
+import numpy as np
 from recorder import BUF, FFMPEG
 
 CLIPS = pathlib.Path(__file__).parent / "clips"
@@ -7,7 +8,7 @@ CLIPS.mkdir(exist_ok=True)
 WHISPER_MODEL = "small"   # "base" быстрее но хуже, "medium" лучше но медленнее
 LANG = "ru"               # язык стрима; None = определять автоматически
 
-_lock = threading.Lock()  # обрабатываем клипы по одному
+_lock = threading.Lock()
 _model = None
 
 
@@ -18,6 +19,17 @@ def get_model():
         print("\n[sub] загружаю Whisper (первый раз качает модель, подожди)...")
         _model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
     return _model
+
+
+def load_audio(path):
+    """Достаём звук через ffmpeg в массив чисел (без библиотеки av)."""
+    r = subprocess.run(
+        [FFMPEG, "-loglevel", "error", "-i", str(path),
+         "-vn", "-f", "f32le", "-ac", "1", "-ar", "16000", "-"],
+        capture_output=True)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.decode(errors="ignore")[-300:])
+    return np.frombuffer(r.stdout, dtype=np.float32)
 
 
 def ass_time(t):
@@ -45,13 +57,15 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 def make_ass(video, ass_path):
     """Whisper -> файл субтитров. Возвращает число фраз."""
+    audio = load_audio(video)
+    if audio.size == 0:
+        return 0
     segments, _ = get_model().transcribe(
-        str(video), language=LANG, word_timestamps=True, vad_filter=True)
+        audio, language=LANG, word_timestamps=True, vad_filter=True)
     words = [w for seg in segments for w in (seg.words or [])]
     if not words:
         return 0
 
-    # режем на куски по 3 слова или по паузе
     chunks, cur = [], []
     for w in words:
         if cur and (len(cur) >= 3 or w.start - cur[-1].end > 0.7):
@@ -66,7 +80,7 @@ def make_ass(video, ass_path):
         start = ch[0].start
         end = ch[-1].end
         if i + 1 < len(chunks) and chunks[i + 1][0].start - end < 0.3:
-            end = chunks[i + 1][0].start      # без мигания между фразами
+            end = chunks[i + 1][0].start
         text = " ".join(w.word.strip() for w in ch).upper()
         text = text.replace("{", "").replace("}", "")
         lines.append(f"Dialogue: 0,{ass_time(start)},{ass_time(end + 0.1)},Default,,0,0,0,,{text}")
@@ -90,7 +104,6 @@ def render_vertical(raw, out, ass_name=None):
            "-filter_complex", fc, "-map", last, "-map", "0:a?",
            "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", str(out)]
-    # cwd=CLIPS, чтобы в фильтре subtitles был простой путь без проблем с экранированием в Windows
     return subprocess.run(cmd, capture_output=True, text=True, cwd=str(CLIPS))
 
 
@@ -125,9 +138,14 @@ def make_clip(peak_ts, before=30, after=10):
     ass = CLIPS / f"sub-{cid}.ass"
     with _lock:
         try:
-            print("[sub] распознаю речь...")
-            n = make_ass(raw, ass)
-            print(f"[sub] фраз: {n}")
+            n = 0
+            try:
+                print("[sub] распознаю речь...")
+                n = make_ass(raw, ass)
+                print(f"[sub] фраз: {n}")
+            except Exception as e:
+                print("[sub] Whisper не сработал, делаю без субтитров:", repr(e))
+
             r = render_vertical(raw, out, ass.name if n else None)
             if r.returncode != 0 and n:
                 print("[clip] субтитры не вшились:", r.stderr[-300:])
